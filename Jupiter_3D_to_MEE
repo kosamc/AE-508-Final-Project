@@ -1,0 +1,216 @@
+clc
+clear 
+
+tic
+%% Paramters
+
+% Constants and Unit Conversions
+AU = 1.496e11;          % Astronomical Unit (m)
+TU = 58.13*24*60*60;    % Time Unit (sec)
+mu = 1.0;               % Gravitational parameter (AU^3/TU^2)
+Isp = 4000;             % Specific impulse (s)
+g0 = 9.8;               % Earth gravity (m/s^2)
+T_N = 0.25;             % Thrust (N)
+m0 = 500;               % Initial mass (kg)
+c = Isp*g0*TU/AU;       % Effective Exhaust Velocity (AU/TU)
+
+% Convert thrust to canonical units
+T = T_N * TU^2/AU;  % Thrust (AU/TU^2)
+
+% Initialize ODE and fsolve options
+opts_ode = odeset('RelTol', 1e-12, 'AbsTol', 1e-14);
+opts_fsolve = optimoptions('fsolve', 'Display', 'iter', 'MaxFunEvals', 300, 'MaxIter', 1500, 'TolFun', 1e-10, 'TolX', 1e-14);
+
+% Define reference date-time (Year, Month, Day, Hour, Minute, Second)
+T0 = datetime(2015,8,26,12,0,0);  % 4/26/2025 12:00:00 UTC
+t0 = 0;
+
+% Array of Final Times to Reach Jupiter
+tf = linspace(840, 900, 15);  % (days)
+Time = tf / 58.13; % Time of Flight (TU)
+
+
+%% Solve Optimal Control to Make Pareto Front
+
+% Initial guess for costates
+lam0 = [18.9525709640833; 11.6625492717043; -23.3729592034115; 0.893407784524420; 1.12775267513797; 8.64039157874070; -0.0399565479182402];
+
+% Create Arrays for Pareto Front Variables
+pareto_tof = zeros(length(tf), 1);     % Time of flight (TU)
+pareto_fuel = zeros(length(tf), 1);    % Fuel used (kg)
+
+% Create Figure
+figure;
+hold on;
+grid on;
+
+for i = 1 : length(tf)
+
+    % Bounds for rho 
+    rho = 1;
+    rho_min = 1e-3;
+    
+    % Time of flight
+    dt = Time(i)*TU;     % (sec)
+    
+    % Initial and Final Positions and Velocites (Ephemeris)
+    [X0, V0, Xf, Vf] = Ephemeris(T0, dt, 'Earth', 'Mars');   % (AU) & (AU/day)
+    V0 = V0*58.13;      % (AU/Day * Day/TU = AU/TU)
+    Vf = Vf*58.13;      % (AU/Day * Day/TU = AU/TU)
+    
+    % Convert to MEE
+    MEE_0 = Cart_2_MEE(X0', V0', mu);    % MEE coordinates of Earth at Initial Time
+    x0 = [MEE_0; m0];                    % Inital State vector (MEE coords. and mass)
+    MEE_f = Cart_2_MEE(Xf, Vf, mu);      % MEE coordinates of Taregt Planet at Final Time
+
+    while rho >= rho_min
+
+        % Solve for costates
+        [lam0, fval] = fsolve(@(lam) Cost_Function(lam, t0, Time(i), x0, MEE_f, mu, T, c, rho, opts_ode), lam0, opts_fsolve);
+        
+        % Simulate trajectory with current solution
+        [t, X] = ode45(@(t,X) EOM_MEE_Minfuel(t, X, c, T, rho, mu), [t0, Time(i)], [x0; lam0], opts_ode);
+
+        % Decrease rho
+        rho = 0.3 * rho;
+        disp('rho =')
+        disp(rho)
+    end
+
+    % Save Pareto data
+    pareto_tof(i) = Time(i);
+    pareto_fuel(i) = X(1,7) - X(end,7);
+
+end
+
+% Sort for smoother curve
+[pareto_tof_sorted, idx] = sort(pareto_tof);
+pareto_fuel_sorted = pareto_fuel(idx);
+
+% Plot current Pareto front
+dateStr = datestr(T0, 'mm/dd/yyyy');
+plot(pareto_tof_sorted*58.13, pareto_fuel_sorted, 'bo-', 'LineWidth', 1.5, 'MarkerSize', 3, 'DisplayName', ['Start Date = ', dateStr])
+
+% Multi-objective optimal point
+J = 0.5*(pareto_tof_sorted + pareto_fuel_sorted);
+[t_star, j_star] = min(J);
+
+% Plot/Annotate optimal point
+plot(pareto_tof_sorted(j_star)*58.13, pareto_fuel_sorted(j_star), 'bs', 'MarkerSize', 10, 'DisplayName', 'Multi-Objective Optimum','MarkerFaceColor', 'b');
+
+% Label Figure
+xlabel('Time of Flight (Days)')
+ylabel('Fuel Consumption (kg)')
+title('Pareto Front: Fuel Consumption vs Time of Flight')
+subtitle('Earth-Jupiter Transfer: 3D MEE Coordinates')
+legend('Location','best')
+
+
+%% Functions
+
+function MEE = Cart_2_MEE(R, V, mu)
+    
+    % Angular Momentum
+    h_vec = cross(R, V);
+    h = norm(h_vec);
+    R_hat = R/norm(R);
+    W_hat = h_vec/h;
+    S_hat = cross(W_hat, R_hat);
+
+    % Eccentricity
+    e_vec = (1/mu)*(cross(V,h_vec) - R_hat);
+    e = norm(e_vec);
+    
+    % Inclination
+    K_hat = [0; 0; 1];  % Vector Orthogonal to Earth Equatorial Plane
+    i = acos(dot(W_hat, K_hat));
+
+    % Right Ascension of Ascending Node
+    n = cross(K_hat, h_vec);
+    I_hat = [1; 0; 0];
+    Omega = acos(dot(n, I_hat)/norm(n)); 
+    J_hat = [0 1 0];
+    if dot(n, J_hat) < 0
+        Omega = 2*pi - Omega;
+    end
+
+    % Argument of Perigee (little omega)
+    w = acos(dot(n, e_vec) / (norm(n)*e)); 
+    if dot(e_vec, K_hat) < 0
+        w = 2*pi - w;
+    end
+
+    % True Anomaly
+    theta = acos(dot(R, e_vec) / (norm(R)*e));
+    if dot(R, V) < 0
+        theta = 2*pi - theta;
+    end
+
+    % Calculate MEE's from Orbital Elements
+    p = h^2/mu;
+    f = e*cos(Omega + w);
+    g = e*sin(Omega + w);
+    h = tan(i/2)*cos(Omega);
+    k = tan(i/2)*sin(Omega);
+    L = Omega + w + theta;
+
+    % MEE State Vector
+    MEE = [p; f; g; h; k; L];
+
+end
+
+%------------------------------------------------------------------------
+
+function [X0, V0, Xf, Vf] = Ephemeris(t0, dt, Planet_0, Planet_f)
+    % t0 = date-time
+    % dt = transfer time length
+    % Planet_0 & Planet_f = Strings of Planet Names
+   
+    % Ephemeris data of inital position of Earth
+    [X0, V0] = planetEphemeris(juliandate(t0), 'Sun', Planet_0, '432t', 'AU');
+    
+    % Convert seconds to duration
+    delta_t = seconds(dt);
+    
+    % Compute the new date-time
+    new_time = t0 + delta_t;
+    
+    % Extract components
+    Year = year(new_time);
+    Month = month(new_time);
+    Day = day(new_time);
+    Hour = hour(new_time);
+    Minute = minute(new_time);
+    Second = second(new_time);
+    
+    % Define final date-time
+    tf = datetime(Year, Month, Day, Hour, Minute, Second);
+    
+    % Ephemeris data of final position of Jupiter
+    [Xf, Vf] = planetEphemeris(juliandate(tf), 'Sun', Planet_f, '432t', 'AU');
+
+    % Make column vectors
+    X0 = X0';
+    V0 = V0';
+    Xf = Xf';
+    Vf = Vf';
+
+end
+
+%--------------------------------------------------------------------------------------
+
+function Error = Cost_Function(lam0_guess, t0, tf, x0, xf, mu, T, c, rho, opts_ode)
+
+    % Propagate System
+    [t, X] = ode45(@(t,X) EOM_MEE_Minfuel(t, X, c, T, rho, mu), [t0, tf], [x0; lam0_guess]', opts_ode);
+    
+    % Form Error Vector
+    Error = [X(end, 1) - xf(1);     % Final p error
+             X(end, 2) - xf(2);     % Final f error
+             X(end, 3) - xf(3);     % Final g error
+             X(end, 4) - xf(4);     % Final h error
+             X(end, 5) - xf(5);     % Final k error
+             X(end, 6) - xf(6);     % Final L error 
+             X(end, 14)];           % lam_m final = 0 (free final mass)
+end
+toc
