@@ -1,0 +1,65 @@
+clc
+clear
+
+NoEqn = 7;   % Number of Equations
+
+syms t p f g h k L m u_r u_t u_n T c rho delta mu
+
+x = [p; f; g; h; k; L; m];
+U = [u_r; u_t; u_n];
+
+% Symbolic Costates
+lambda = cell(NoEqn, 1);
+
+for i = 1 : NoEqn
+    lambda{i} = sprintf('lambda%d', i);
+end
+lambda = lambda(:);
+lambda = sym(lambda, 'real');
+
+% Equations of Motion
+sinL = sin(L);
+cosL = cos(L);
+q = 1 + f*cosL + g*sinL;
+s = 1 + h^2 + k^2;
+C1 = sqrt(p/mu);
+C2 = 1/q;
+C3 = h*sinL - k*cosL;
+
+A = [0; 0; 0; 0; 0; sqrt(mu*p)*(q/p)^2; -(T/c)*delta];
+
+B = [        0,               2*p*C2*C1,                0;
+       C1*sinL,    C1*C2*((q+1)*cosL+f),     -C1*(g/q)*C3;
+      -C1*cosL,    C1*C2*((q+1)*sinL+g),      C1*(f/q)*C3;
+             0,                       0,   C1*s*cosL*C2/2;
+             0,                       0,   C1*s*sinL*C2/2;
+             0,                       0,         C1*C2*C3;
+             0,                       0,                0];
+
+x_dot = A + T/m*delta*B*U;
+
+% Hamiltonian
+H = T/c*delta + lambda.'*x_dot;
+
+% Costate Equations
+lambda_dot = -jacobian(H, x).';
+
+% Optimal Control
+BTL = B.'*lambda;
+u_opt = -BTL/sqrt(BTL.'*BTL);
+
+% Switch Function
+S = (T/c)*((c/m)*sqrt(BTL.'*BTL) + lambda(7) - 1);
+
+% Throttle
+delta_opt = 0.5*(1 + tanh(S/rho));
+
+% Form state/costate vector
+F = [x_dot; lambda_dot];
+
+% Sub optimal paramters into state vector
+F = subs(F, U, u_opt);
+F = subs(F, delta, delta_opt);
+
+% Save as .m file
+fc = matlabFunction(F, 'file', 'EOM_MEE_Minfuel.m', 'Optimize', true, 'vars', {t, [x;lambda], c, T, rho, mu}, 'outputs', {'Xdot'});
