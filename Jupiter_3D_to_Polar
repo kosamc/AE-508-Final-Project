@@ -1,0 +1,374 @@
+clc
+clear
+
+tic
+%% Parameters
+
+% Constants
+mu = 1;             % Gravitational Parameter % (AU^3/TU^2)
+m_0 = 500;          % Initial Mass of Spacecraft (kg)
+I_sp = 4155;        % Specififc Impulse (sec)
+g_0 = 9.81;         % Acceleration due to Gravity (m/s^2)
+T_N = 0.235;        % Propulsion System Thrust (N)
+
+% Conversion Factors
+m_to_AU = 6.68459e-12;     % (AU/m)
+TU_to_sec = 5022432;       % (s/TU)
+velocity_AUTU = m_to_AU * TU_to_sec;   % (m/s * AU/m * s/TU = AU/TU)
+accel_AUTU2 = m_to_AU * TU_to_sec^2;   % (m/s^2 * AU/m * (s/TU)^2 = AU/TU^2)
+
+% Convert exhaust velocity to AU/TU
+c_ms = I_sp * g_0;         % (m/s)
+c = c_ms * velocity_AUTU;  % (AU/TU)
+
+% Convert thrust to Kg*AU/TU^2
+Thrust = T_N * accel_AUTU2;    % (Kg*AU/TU^2)
+
+
+ %% Solve Optimal Control to Make Pareto Front
+
+% Create Figure
+figure
+hold on
+grid on
+
+years = [1985 2005 2025];
+colors = lines(length(years));
+
+for j = 1 : length(years)
+    %Define reference date-time (Year, Month, Day, Hour, Minute, Second)
+    T0 = datetime(years(j),8,26,12,0,0);  % 4/26/20X5 12:00:00 UTC
+    t0 = 0;
+    
+    % Array of final times to reach Jupiter
+    t_f = linspace(1050, 1250, 3);         % Time of Flight (days)
+    Time = t_f / 58.13;                     % Time of Flight (TU)
+    
+    % Initial Guess for Costate Variables
+    lambda_0 = [-2.42954226815575; -2.52081784419732e-28; 0.773473548140664; -2.80129578635551; 0.00539130160703765];
+    
+    
+    % Create Arrays for Pareto Fronts
+    pareto_tof = zeros(length(t_f), 1);     % Time of flight
+    pareto_fuel = zeros(length(t_f), 1);    % Fuel used
+    
+    for i = 1:length(t_f)
+        % Bounds for rho 
+        rho = 1;
+        rho_min = 1e-3;
+        
+        % Solver Options
+        options_ode = odeset('RelTol', 1e-12, 'AbsTol', 1e-14);
+        options_fsolve = optimoptions('fsolve', 'Display', 'iter', 'MaxFunEvals', 1000, 'MaxIter', 1000, 'TolFun', 1e-12, 'TolX', 1e-14);
+    
+        % Time of flight
+        dt = Time(i)*TU_to_sec;     % (sec)
+    
+        % ICs and FCs
+        [R0, V0, Rf, Vf] = Ephemeris(T0, dt, 'Earth', 'Jupiter');   % (AU) & (AU/day)
+        V0 = V0*58.13;     % (AU/Day * Day/TU = AU/TU)
+        Vf = Vf*58.13;     % (AU/Day * Day/TU = AU/TU) 
+        [h_0, e_0, theta_0] = Cart_2_Polar(R0', V0', mu);
+        [h_f, e_f, theta_f] = Cart_2_Polar(Rf', Vf', mu);
+        
+        r_0 = norm(R0);      % Initial Earth Radius (AU)
+        v_0 = norm(V0);      % Initial Velocity (AU/TU)
+        r_F = norm(Rf);      % Final Jupiter Radius (AU)
+        v_F = norm(Vf);      % Final Velocity (AU/TU)
+        X_0 = [r_0; theta_0; 0; v_0; m_0];  % [r_0; theta_0; u_0; v_0; m_0]
+        
+        while rho >= rho_min
+            % Solve for Optimal Initial Costate Variables
+            [lambda_0, f_val] = fsolve(@(lambda) State_Errors(lambda, X_0, r_F, theta_f, v_F, Time(i), c, rho, Thrust, options_ode), lambda_0, options_fsolve);
+            
+            % Integrate to get Optimal Trajectory
+            [t, X] = ode45(@(t, X) Dynamics(t, X, Thrust, c, rho), [0, Time(i)], [X_0; lambda_0], options_ode);
+            
+            % Decrease rho
+            rho = 0.5 * rho;
+            disp('rho =')
+            disp(rho)
+    
+        end
+
+        % Extract Control Inputs
+        u_r = -X(:,8) / norm([X(:,8), X(:,9)]);
+        u_theta = -X(:,9) / norm([X(:,8), X(:,9)]);
+
+        % Polar Plot
+        figure
+        polarplot(X(:,2), X(:,1), 'b--', 'LineWidth', 2.5)
+        hold on
+        theta = linspace(0, 2*pi, 100);
+        polarplot(theta, r_0*ones(size(theta)), 'g-', 'LineWidth', 1.2);
+        polarplot(theta, r_F*ones(size(theta)), 'r-', 'LineWidth', 1.2);
+        polarplot(X(1,2), r_0, 'mo','LineWidth', 3)
+        polarplot(X(end,2), r_F, 'kx','LineWidth', 3)
+        title('"Bang-Bang" Control Earth-Jupiter Transfer')
+        dateStr = datestr(T0, 'mm/dd/yyyy');
+        subtitle(['TOF = ', num2str(t_f(i)),' Days, Start Date =', dateStr])
+        legend('Transfer Trajectory', 'Earth Orbit', 'Jupiter Orbit', 'Earth', 'Rendezvous')
+        grid on
+        %------------------------------------------------------------------------------------
+        
+        % States
+        figure
+        sgtitle(['States vs Time: TOF = ', num2str(t_f(i)),' Days, \theta_f = ', num2str(theta_F),' rad'])
+        subplot(3,2,1)
+        plot(t, X(:,1), 'b-', 'LineWidth', 2)
+        title('Radial Position vs Time')
+        ylabel('r (AU)')
+        grid on
+
+        subplot(3,2,2);
+        plot(t, X(:,2), 'b-', 'LineWidth', 2)
+        title('Angular Position vs Time')
+        ylabel('\theta (rad)')
+        grid on
+
+        subplot(3,2,3);
+        plot(t, X(:,3), 'b-', 'LineWidth', 2)
+        title('Radial Velocity vs Time')
+        ylabel('u (AU/TU)')
+        grid on
+
+        subplot(3,2,4);
+        plot(t, X(:,4), 'b-', 'LineWidth', 2)
+        title('Tangential Velocity vs Time')
+        ylabel('v (AU/TU)')
+        xlabel('Time (TU)')
+        grid on
+
+        subplot(3,2,5);
+        plot(t, X(:,5), 'b-', 'LineWidth', 2)
+        title('Mass vs Time')
+        ylabel('m (kg)')
+        xlabel('Time (TU)')
+        grid on
+        %-------------------------------------------------------------------------
+
+        % Costates
+        figure
+        sgtitle(['Cotates vs Time: TOF = ', num2str(t_f(i)),' Days, \theta_f = ', num2str(theta_F),' rad'])
+        subplot(3,2,1)
+        plot(t, X(:,6), 'b-', 'LineWidth', 2)
+        title('Radial Position Costate vs Time')
+        ylabel('\lambda_r')
+        grid on
+
+        subplot(3,2,2);
+        plot(t, X(:,7), 'b-', 'LineWidth', 2)
+        title('Angular Position Costate vs Time')
+        ylabel('\lambda_\theta')
+        grid on
+
+        subplot(3,2,3);
+        plot(t, X(:,8), 'b-', 'LineWidth', 2)
+        title('Radial Velocity Costate vs Time')
+        ylabel('\lambda_u')
+        grid on
+
+        subplot(3,2,4);
+        plot(t, X(:,9), 'b-', 'LineWidth', 2)
+        title('Tangential Velocity Costate vs Time')
+        ylabel('\lambda_v')
+        xlabel('Time (TU)')
+        grid on
+
+        subplot(3,2,5);
+        plot(t, X(:,10), 'b-', 'LineWidth', 2)
+        title('Mass Costate vs Time')
+        ylabel('\lambda_m')
+        xlabel('Time (TU)')
+        grid on
+        %-------------------------------------------------------------------------
+
+        % Control Input
+        figure
+        sgtitle(['Control vs Time: TOF = ', num2str(t_f(i)),' Days, \theta_f = ', num2str(theta_F),' rad'])
+        subplot(2,1,1)
+        plot(t, u_r, 'r-', 'LineWidth', 2)
+        title('Radial Control Input vs Time')
+        ylabel('u_r')
+        grid on
+
+        subplot(2,1,2)
+        plot(t, u_theta, 'r-', 'LineWidth', 2)
+        title('Tangential Control Input vs Time')
+        ylabel('u_\theta')
+        xlabel('Time (TU)')
+        grid on
+        %-------------------------------------------------------------------------
+
+        % Switch Function
+        figure
+        p = vecnorm([X(:,8), X(:,9)], 2, 2);    % Primer Vector over time
+        S = p - 1;          % Switch function over time
+        plot(t, S, 'b-', 'LineWidth', 2)
+        title('Switch Function vs Time')
+        subtitle(['TOF = ', num2str(t_f(i)),' Days, \theta_f = ', num2str(theta_F),' rad'])
+        ylabel('S')
+        xlabel('Time (TU)')
+        grid on
+        
+        %-------------------------------------------------------------------------
+        
+        % Thrust Profile
+        figure
+        delta = 0.5 * (1 + tanh(S / rho));
+        Thrust_profile = Thrust * delta;
+        plot(t, Thrust_profile/accel_AUTU2, 'r-', 'LineWidth', 2)
+        title('Thrust vs Time')
+        subtitle(['TOF = ', num2str(t_f(i)),' Days, Start Date =', dateStr])
+        ylabel('Thrust (N)')
+        xlabel('Time (TU)')
+        grid on
+    
+        % Save Pareto data
+        pareto_tof(i) = Time(i);
+        pareto_fuel(i) = X(1,5) - X(end,5);
+    end
+    
+    % Sort for smoother curve
+    [pareto_tof_sorted, idx] = sort(pareto_tof);
+    pareto_fuel_sorted = pareto_fuel(idx);
+    
+    % Plot current Pareto front
+    dateStr = datestr(T0, 'mm/dd/yyyy');
+    plot(pareto_tof_sorted*58.13, pareto_fuel_sorted, 'o-', 'Color', colors(j,:), 'LineWidth', 1.5, ...
+        'MarkerSize', 3, 'DisplayName', ['Start Date = ', dateStr])
+    
+    % Mark multi-objective optimal point
+    J = 0.5*(pareto_tof_sorted + pareto_fuel_sorted);
+    [t_star, j_star] = min(J);
+    
+    % Plot/Annotate optimal point
+    plot(pareto_tof_sorted(j_star)*58.13, pareto_fuel_sorted(j_star), 'bs', ...
+         'MarkerSize', 10, 'MarkerFaceColor', colors(j,:), 'DisplayName', 'Multi-Objective Optimum');
+    
+    xlabel('Time of Flight (days)')
+    ylabel('Fuel Consumption (kg)')
+    title('Pareto Fronts: Fuel Consumption vs Time of Flight')
+    subtitle('Earth-Jupiter Transfer: 3D assumed 2D Planar')
+    legend('Location','best')
+end
+
+%% Functions
+
+function Xdot = Dynamics(t, X, Thrust, c, rho)
+
+    % States
+    r = X(1);       % Radial Position
+    theta = X(2);   % Angular Position
+    u = X(3);       % Radial Velocity
+    v = X(4);       % Tangential Velocity
+    m = X(5);       % Spacecraft Mass
+
+    % Costates
+    lambda_r = X(6);
+    lambda_theta = X(7);
+    lambda_u = X(8);
+    lambda_v = X(9);
+    lambda_m = X(10);
+
+    % Control Inputs
+    u_r = -lambda_u / norm([lambda_u, lambda_v]);
+    u_theta = -lambda_v / norm([lambda_u, lambda_v]);
+
+    % Engine Throttle
+    P = -[lambda_u, lambda_v];    % Primer Vector
+    S = norm(P) - 1;              % Switch Function
+    delta = 0.5*(1 + tanh(S / rho));
+
+    % Equations of Motion
+    rdot = u;
+    thetadot = v/r;
+    udot = v^2/r - 1/r^2 + (Thrust/m)*delta*u_r;
+    vdot = -u*v/r + (Thrust/m)*delta*u_theta;
+    mdot = -(Thrust/c)*delta;
+
+    % Costate Equations
+    lambda_rdot = lambda_theta*(v/r^2) + lambda_u*(v^2/r^2 - 2/r^3) - lambda_v*(u*v/r^2);
+    lambda_thetadot = 0;
+    lambda_udot = -lambda_r + lambda_v*(v/r);
+    lambda_vdot = -lambda_theta*(1/r) - lambda_u*(2*v/r) + lambda_v*(u/r);
+    lambda_mdot = (Thrust/(m^2))*delta*(lambda_u*u_r + lambda_v*u_theta);
+
+    % Form State Vector
+    Xdot = [rdot; thetadot; udot; vdot; mdot; lambda_rdot; lambda_thetadot; lambda_udot; lambda_vdot; lambda_mdot];
+end
+
+
+%----------------------------------------------------------------------------------------
+
+function error = State_Errors(lambda_guess, X_0, r_F, theta_F, v_F, Time, c, rho, Thrust, options_ode)
+
+    % Propagate System
+    [t, X] = ode45(@(t, X) Dynamics(t, X, Thrust, c, rho), [0, Time], [X_0; lambda_guess], options_ode);
+    
+    % Form Error Vector
+    error = [X(end, 1) - r_F;     % Radial position error
+             X(end, 2) - theta_F; % Angular Positon error
+             X(end, 3);           % Radial velocity ~ 0 (circular orbit)
+             X(end, 4) - v_F;     % Tangential velocity error
+             X(end, 10)];         % Mass Costate ~ 0 (Satisfy Final Condition)
+end
+
+%---------------------------------------------------------------------------------------------------
+
+function [h, e, theta] = Cart_2_Polar(R, V, mu)
+    
+    % Angular Momentum
+    h_vec = cross(R, V);
+    h = norm(h_vec);
+    R_hat = R/norm(R);
+
+    % Eccentricity
+    e_vec = (1/mu)*(cross(V,h_vec) - R_hat);
+    e = norm(e_vec);
+ 
+    % True Anomaly
+    theta = acos(dot(R, e_vec) / (norm(R)*e));
+    if dot(R, V) < 0
+        theta = 2*pi - theta;
+    end
+end
+
+%------------------------------------------------------------------------
+
+function [X0, V0, Xf, Vf] = Ephemeris(t0, dt, Planet_0, Planet_f)
+    % t0 = date-time
+    % dt = transfer time length
+    % Planet_0 & Planet_f = Strings of Planet Names
+   
+    % Ephemeris data of inital position of Earth
+    [X0, V0] = planetEphemeris(juliandate(t0), 'Sun', Planet_0, '432t', 'AU');  % (AU) & (AU/day)
+    
+    % Convert seconds to duration
+    delta_t = seconds(dt);
+    
+    % Compute the new date-time
+    new_time = t0 + delta_t;
+    
+    % Extract components
+    Year = year(new_time);
+    Month = month(new_time);
+    Day = day(new_time);
+    Hour = hour(new_time);
+    Minute = minute(new_time);
+    Second = second(new_time);
+    
+    % Define final date-time
+    tf = datetime(Year, Month, Day, Hour, Minute, Second);
+    
+    % Ephemeris data of final position of Jupiter
+    [Xf, Vf] = planetEphemeris(juliandate(tf), 'Sun', Planet_f, '432t', 'AU'); % (AU) & (AU/day)
+
+    % Make column vectors
+    X0 = X0';
+    V0 = V0';
+    Xf = Xf';
+    Vf = Vf';
+
+end
+toc
